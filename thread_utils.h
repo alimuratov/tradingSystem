@@ -4,37 +4,62 @@
 #include <atomic>
 #include <thread>
 #include <unistd.h>
+#include <jthread>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
 
 #include <sys/syscall.h>
 
-namespace Common {
-  /// Set affinity for current thread to be pinned to the provided core_id.
-  inline auto setThreadCore(int core_id) noexcept {
-    cpu_set_t cpuset;
+namespace Common
+{
+    /// Set affinity for current thread to be pinned to the provided core_id.
+    inline bool set_thread_core(int core_id) noexcept
+    {
+        if (core_id < 0)
+        {
+            thread_affinity_policy_data_t policy{0};
+            return thread_policy_set(mach_thread_self(),
+                                     THREAD_AFFINITY_POLICY,
+                                     reinterpet_cast<thread_policy_t>(&policy),
+                                     THREAD_AFFINITY_POLICY_COUNT) == KERN_SUCCESS;
 
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
+            thread_affinity_policy_data_t policy{static_cast<integer_t>(core_id + 1)};
+            return thread_policy_set(mach_thread_self(),
+                                     THREAD_AFFINITY_POLICY,
+                                     reinterpret_cast<thread_policy_t>(&policy),
+                                     THREAD_AFFINITY_POLICY_COUNT) == KERN_SUCCESS;
+        }
+    }
 
-    return (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0);
-  }
+    // invocable to constrain the template to reject the non-callables immediately
+    template <std::invocable<Args...> F, typename... Args>
+    std::jthread create_and_start_thread(int core_id,
+                                         const std::string &name,
+                                         F &&f, Args &&...args)
+    {
+        std::promise<void> started;
+        // parent thread only proceeds once the new thread has signaled that it has actually started
+        std::future<void> started_fut = started.get_future();
 
-  /// Creates a thread instance, sets affinity on it, assigns it a name and
-  /// passes the function to be run on that thread as well as the arguments to the function.
-  template<typename T, typename... A>
-  inline auto createAndStartThread(int core_id, const std::string &name, T &&func, A &&... args) noexcept {
-    auto t = new std::thread([&]() {
-      if (core_id >= 0 && !setThreadCore(core_id)) {
-        std::cerr << "Failed to set core affinity for " << name << " " << pthread_self() << " to " << core_id << std::endl;
-        exit(EXIT_FAILURE);
-      }
-      std::cerr << "Set core affinity for " << name << " " << pthread_self() << " to " << core_id << std::endl;
+        auto body = [=, &started](F &&Fn, Args &&...as) mutable
+        {
+            try
+            {
+                if (core_id >= 0)
+                    set_thread_core(core_id);
+                started.set_value();
+                std::invoke(std::forward<F>(fn),
+                            std::forward<Args>(as)...);
+            }
+            catch (...)
+            {
+                started.set_exception(std::current_exception());
+            }
+        };
 
-      std::forward<T>(func)((std::forward<A>(args))...);
-    });
-
-    using namespace std::literals::chrono_literals;
-    std::this_thread::sleep_for(1s);
-
-    return t;
-  }
+        // thread is automatically joined on destruction
+        std::jthread t(body, std::forward<F>(f), std::forward<Args>(args)...);
+        started_fut.get();
+        return t;
+    }
 }
